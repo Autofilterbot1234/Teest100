@@ -400,35 +400,109 @@ index_template = """
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap');
-        :root { --primary: #E50914; --dark: #0f0f0f; --card-bg: #1a1a1a; --text: #fff; }
+        @import url('https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@400;500;600;700&display=swap'); /* For Bangla Text */
+        
+        :root { --primary: #E50914; --dark: #0f1012; --card-bg: #1a1a1a; --text: #fff; --red-btn: #cc0000; }
         * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Poppins', sans-serif; -webkit-tap-highlight-color: transparent; }
         body { background-color: var(--dark); color: var(--text); padding-bottom: 70px; }
         a { text-decoration: none; color: inherit; }
         
-        .navbar { display: flex; justify-content: space-between; align-items: center; padding: 12px 15px; background: rgba(0,0,0,0.8); backdrop-filter: blur(10px); position: sticky; top: 0; z-index: 100; border-bottom: 1px solid #222; }
-        .logo { font-size: 20px; font-weight: 700; color: var(--primary); text-transform: uppercase; }
-        .search-box { position: relative; }
-        .search-box input { background: #222; border: 1px solid #333; padding: 8px 15px; padding-right: 35px; border-radius: 20px; color: #fff; outline: none; width: 140px; font-size: 13px; transition: width 0.3s; }
-        .search-box input:focus { width: 180px; border-color: var(--primary); }
-        .search-box i { position: absolute; right: 12px; top: 50%; transform: translateY(-50%); color: #777; font-size: 12px; pointer-events: none; }
+        /* NAVBAR */
+        .navbar { display: flex; justify-content: space-between; align-items: center; padding: 12px 15px; background: #161616; border-bottom: 1px solid #222; }
+        .logo { font-size: 22px; font-weight: 800; color: var(--primary); text-transform: uppercase; letter-spacing: 1px; }
+        .nav-icons { color: #fff; font-size: 18px; }
 
-        /* CATEGORY BAR */
-        .category-bar { display: flex; overflow-x: auto; gap: 10px; padding: 10px 15px; background: #111; scrollbar-width: none; }
-        .category-bar::-webkit-scrollbar { display: none; }
-        .cat-pill { white-space: nowrap; background: #222; color: #ccc; padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: 500; transition: 0.2s; border: 1px solid #333; }
-        .cat-pill.active, .cat-pill:hover { background: var(--primary); color: white; border-color: var(--primary); }
+        /* CATEGORY GRID (RED BUTTONS) */
+        .category-container {
+            padding: 15px 10px;
+            background: #121212;
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: center;
+            gap: 8px;
+        }
 
-        .hero { height: 280px; background-size: cover; background-position: center; position: relative; display: flex; align-items: flex-end; margin-bottom: 20px; }
+        .cat-btn {
+            background: var(--red-btn);
+            color: white;
+            padding: 8px 12px;
+            border-radius: 6px;
+            font-size: 13px;
+            font-weight: 700;
+            text-transform: uppercase;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            border: 1px solid #990000;
+            box-shadow: 0 3px 0 #800000; /* 3D Effect */
+            transition: transform 0.1s, box-shadow 0.1s;
+            white-space: nowrap;
+        }
+
+        .cat-btn:active {
+            transform: translateY(3px);
+            box-shadow: none;
+        }
+        
+        .cat-btn.active {
+            background: #ffcc00;
+            color: #000;
+            border-color: #cc9900;
+            box-shadow: 0 3px 0 #997700;
+        }
+
+        .cat-btn i, .cat-btn span.emoji { font-size: 14px; }
+
+        /* BIG SEARCH BAR (Like Image) */
+        .search-wrapper {
+            padding: 5px 15px 20px 15px;
+            background: #121212;
+            display: flex;
+            justify-content: center;
+        }
+        .big-search-box {
+            width: 100%;
+            max-width: 600px;
+            display: flex;
+            background: #1e252b;
+            border: 2px solid #00c3ff;
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 0 10px rgba(0, 195, 255, 0.2);
+        }
+        .big-search-box input {
+            flex: 1;
+            background: transparent;
+            border: none;
+            padding: 12px 15px;
+            color: #fff;
+            font-family: 'Hind Siliguri', sans-serif;
+            font-size: 16px;
+            outline: none;
+        }
+        .big-search-box button {
+            background: #00c3ff;
+            border: none;
+            width: 55px;
+            cursor: pointer;
+            color: #fff;
+            font-size: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        /* HERO & CONTENT */
+        .hero { height: 280px; background-size: cover; background-position: center; position: relative; display: flex; align-items: flex-end; margin-bottom: 20px; margin-top: 10px;}
         .hero::after { content: ''; position: absolute; inset: 0; background: linear-gradient(to top, var(--dark) 0%, transparent 100%); }
         .hero-content { position: relative; z-index: 2; padding: 20px; width: 100%; }
         .hero-title { font-size: 1.8rem; line-height: 1.2; text-shadow: 0 2px 4px rgba(0,0,0,0.8); margin-bottom: 5px; }
         .btn-play { background: var(--primary); border: none; padding: 8px 20px; border-radius: 4px; color: #fff; font-weight: 600; font-size: 0.9rem; display: inline-flex; align-items: center; gap: 8px; margin-top: 10px; }
 
         .section { padding: 0 15px; }
-        .section-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 15px; }
-        .section-title { font-size: 1.1rem; border-left: 3px solid var(--primary); padding-left: 10px; font-weight: 600; }
+        .section-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 15px; border-left: 4px solid var(--primary); padding-left: 10px; }
+        .section-title { font-size: 1.2rem; font-weight: 700; text-transform: uppercase; }
 
-        /* UPDATED GRID FOR BIGGER POSTERS */
         .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
         @media (min-width: 600px) { .grid { grid-template-columns: repeat(3, 1fr); gap: 15px; } }
         @media (min-width: 900px) { .grid { grid-template-columns: repeat(5, 1fr); gap: 20px; } }
@@ -443,7 +517,6 @@ index_template = """
         .rating-badge { position: absolute; top: 6px; left: 6px; background: rgba(0,0,0,0.7); color: #ffb400; padding: 2px 5px; border-radius: 3px; font-size: 0.65rem; font-weight: bold; backdrop-filter: blur(4px); }
         .lang-badge { position: absolute; top: 6px; right: 6px; background: var(--primary); color: #fff; padding: 2px 6px; border-radius: 3px; font-size: 0.6rem; font-weight: 600; text-transform: uppercase; box-shadow: 0 2px 4px rgba(0,0,0,0.3); }
 
-        /* PAGINATION STYLES */
         .pagination { display: flex; justify-content: center; gap: 10px; margin: 30px 0; }
         .page-btn { padding: 8px 16px; background: #222; border-radius: 4px; color: #fff; font-size: 0.9rem; border: 1px solid #333; transition: 0.2s; }
         .page-btn:hover { background: #333; }
@@ -460,18 +533,50 @@ index_template = """
 
 <nav class="navbar">
     <a href="/" class="logo">{{ site_name }}</a>
-    <form action="/" method="GET" class="search-box">
-        <input type="text" name="q" placeholder="Search..." value="{{ query }}">
-        <i class="fas fa-search"></i>
-    </form>
+    <div class="nav-icons">
+        <i class="fas fa-bell"></i>
+    </div>
 </nav>
 
-<!-- CATEGORY BAR -->
-<div class="category-bar">
-    <a href="/" class="cat-pill {{ 'active' if not selected_cat else '' }}">All</a>
+<!-- RED CATEGORY BUTTONS GRID -->
+<div class="category-container">
+    <a href="/" class="cat-btn {{ 'active' if not selected_cat and not request.args.get('type') else '' }}">
+        <span class="emoji">🏠</span> Home
+    </a>
+    
+    <!-- Static Categories like Image -->
+    <a href="/movies" class="cat-btn {{ 'active' if request.args.get('type') == 'movie' else '' }}">
+        <i class="fas fa-film"></i> All Movies
+    </a>
+    <a href="/series" class="cat-btn {{ 'active' if request.args.get('type') == 'series' else '' }}">
+        <i class="fas fa-tv"></i> All Web Series
+    </a>
+
+    <!-- Dynamic Categories from DB -->
     {% for cat in categories %}
-    <a href="/?cat={{ cat.name }}" class="cat-pill {{ 'active' if selected_cat == cat.name else '' }}">{{ cat.name }}</a>
+    <a href="/?cat={{ cat.name }}" class="cat-btn {{ 'active' if selected_cat == cat.name else '' }}">
+        <!-- Simple logic to assign icons based on name -->
+        {% if 'Bangla' in cat.name %}<span class="emoji">🇧🇩</span>
+        {% elif 'Hindi' in cat.name %}<span class="emoji">🇮🇳</span>
+        {% elif 'English' in cat.name %}<span class="emoji">🇺🇸</span>
+        {% elif 'Korean' in cat.name %}<span class="emoji">🇰🇷</span>
+        {% elif 'Dual' in cat.name %}<span class="emoji">🎧</span>
+        {% elif 'Action' in cat.name %}<span class="emoji">⚔️</span>
+        {% elif 'Horror' in cat.name %}<span class="emoji">👻</span>
+        {% elif 'Love' in cat.name or 'Romance' in cat.name %}<span class="emoji">💘</span>
+        {% elif 'Thriller' in cat.name %}<span class="emoji">🧩</span>
+        {% else %}<i class="fas fa-tag"></i>{% endif %}
+        {{ cat.name }}
+    </a>
     {% endfor %}
+</div>
+
+<!-- BIG SEARCH BAR -->
+<div class="search-wrapper">
+    <form action="/" method="GET" class="big-search-box">
+        <input type="text" name="q" placeholder="সার্চ করে খুঁজে নিন পছন্দের মুভি..." value="{{ query }}">
+        <button type="submit"><i class="fas fa-search"></i></button>
+    </form>
 </div>
 
 {% if not query and not selected_cat and featured %}
@@ -536,7 +641,6 @@ index_template = """
 </body>
 </html>
 """
-
 # --- DETAIL TEMPLATE (Fixed Cast & Trailer) ---
 detail_template = """
 <!DOCTYPE html>
