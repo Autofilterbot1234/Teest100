@@ -4,6 +4,9 @@ import re
 import requests
 import json
 import uuid
+import math
+import threading
+import time
 from flask import Flask, render_template_string, request, redirect, url_for, Response, jsonify
 from pymongo import MongoClient
 from bson.objectid import ObjectId
@@ -26,6 +29,9 @@ SOURCE_CHANNEL_ID = os.getenv("SOURCE_CHANNEL_ID")
 WEBSITE_URL = os.getenv("WEBSITE_URL")
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
+# অটো ডিলিট সময় (সেকেন্ডে) - ১০ মিনিট = ৬০০ সেকেন্ড
+DELETE_TIMEOUT = 600 
+
 # এডমিন ক্রেডেনশিয়াল
 ADMIN_USER = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASS = os.getenv("ADMIN_PASSWORD", "admin")
@@ -36,6 +42,7 @@ try:
     db = client["moviezone_db"]
     movies = db["movies"]
     settings = db["settings"]
+    categories = db["categories"] 
     print("✅ MongoDB Connected Successfully!")
 except Exception as e:
     print(f"❌ MongoDB Connection Error: {e}")
@@ -44,28 +51,14 @@ except Exception as e:
 # === Helper Functions ===
 
 def clean_filename(filename):
-    """
-    ফাইলের নাম ক্লিন করে মেইন টাইটেল বের করে।
-    এটি (., -, _, +) সহ সব চিহ্ন রিমুভ করবে এবং সাল/সিজন দেখলে থেমে যাবে।
-    """
-    # ১. এক্সটেনশন বাদ দেওয়া
+    """ ফাইলের নাম ক্লিন করে মেইন টাইটেল বের করে। """
     name = os.path.splitext(filename)[0]
-
-    # ২. সব ধরণের সেপারেটর (ডট, হাইফেন, প্লাস, আন্ডারস্কোর, ব্র্যাকেট) কে স্পেস দিয়ে রিপ্লেস করা
-    # এতে 'Open.Season' হয়ে যাবে 'Open Season'
     name = re.sub(r'[._\-\+\[\]\(\)]', ' ', name)
-
-    # ৩. নাম কাটার বাউন্ডারি নির্ধারণ (যেসব শব্দ দেখলে নাম নেওয়া বন্ধ করবে)
-    # সাল (19xx-20xx), সিজন (S01), এপিসোড (E01), কোয়ালিটি (1080p), ভাষা বা সোর্স
     stop_pattern = r'(\b(19|20)\d{2}\b|\bS\d+|\bSeason|\bEp?\s*\d+|\b480p|\b720p|\b1080p|\b2160p|\bHD|\bWeb-?dl|\bBluray|\bDual|\bHindi|\bBangla)'
-    
     match = re.search(stop_pattern, name, re.IGNORECASE)
     if match:
-        name = name[:match.start()] # স্টপ প্যাটার্ন পাওয়ার আগের অংশটুকু নিবে
-
-    # ৪. অতিরিক্ত স্পেস রিমুভ করা
+        name = name[:match.start()]
     name = re.sub(r'\s+', ' ', name).strip()
-    
     return name
 
 def get_file_quality(filename):
@@ -79,12 +72,8 @@ def get_file_quality(filename):
 def detect_language(text):
     text = text.lower()
     detected = []
-
-    if re.search(r'\b(multi|multi audio)\b', text):
-        return "Multi Audio"
-    
-    if re.search(r'\b(dual|dual audio)\b', text):
-        detected.append("Dual Audio")
+    if re.search(r'\b(multi|multi audio)\b', text): return "Multi Audio"
+    if re.search(r'\b(dual|dual audio)\b', text): detected.append("Dual Audio")
 
     lang_map = {
         'Bengali': ['bengali', 'bangla', 'ben'],
@@ -95,24 +84,19 @@ def detect_language(text):
         'Korean': ['korean', 'kor'],
         'Japanese': ['japanese', 'jap']
     }
-
     for lang_name, keywords in lang_map.items():
         pattern = r'\b(' + '|'.join(keywords) + r')\b'
         if re.search(pattern, text):
             detected.append(lang_name)
 
-    if not detected:
-        return "English"
-
+    if not detected: return "English"
     return " + ".join(list(dict.fromkeys(detected)))
 
 def get_episode_label(filename):
     label = ""
     season = ""
-    
     match_s = re.search(r'\b(S|Season)\s*(\d+)', filename, re.IGNORECASE)
-    if match_s:
-        season = f"S{int(match_s.group(2)):02d}"
+    if match_s: season = f"S{int(match_s.group(2)):02d}"
 
     match_range = re.search(r'E(\d+)\s*-\s*E?(\d+)', filename, re.IGNORECASE)
     if match_range:
@@ -121,34 +105,70 @@ def get_episode_label(filename):
         return f"{season} {episode_part}" if season else episode_part
 
     match_se = re.search(r'\bS(\d+)\s*E(\d+)\b', filename, re.IGNORECASE)
-    if match_se:
-        return f"S{int(match_se.group(1)):02d} E{int(match_se.group(2)):02d}"
+    if match_se: return f"S{int(match_se.group(1)):02d} E{int(match_se.group(2)):02d}"
     
     match_ep = re.search(r'\b(Episode|Ep|E)\s*(\d+)\b', filename, re.IGNORECASE)
     if match_ep:
         ep_num = int(match_ep.group(2))
-        if ep_num < 1900: 
-            return f"{season} Episode {ep_num}".strip()
+        if ep_num < 1900: return f"{season} Episode {ep_num}".strip()
     
     if season: return f"Season {int(match_s.group(2))}"
     return None
 
+# --- BACKGROUND DELETE FUNCTION ---
+def delete_message_later(chat_id, message_id, delay):
+    """ নির্দিষ্ট সময় পর মেসেজ ডিলিট করার ফাংশন """
+    time.sleep(delay)
+    try:
+        del_url = f"{TELEGRAM_API_URL}/deleteMessage"
+        requests.post(del_url, json={"chat_id": chat_id, "message_id": message_id})
+        print(f"🗑️ Auto Deleted Message {message_id} from {chat_id}")
+    except Exception as e:
+        print(f"⚠️ Failed to delete message: {e}")
+
+# --- TMDB FUNCTION ---
 def get_tmdb_details(title, content_type="movie", year=None):
     if not TMDB_API_KEY: return {"title": title}
     tmdb_type = "tv" if content_type == "series" else "movie"
     try:
         query_str = requests.utils.quote(title)
         search_url = f"https://api.themoviedb.org/3/search/{tmdb_type}?api_key={TMDB_API_KEY}&query={query_str}"
-        
-        # যদি সাল পাওয়া যায় এবং এটি মুভি হয়, তাহলে সাল দিয়ে সার্চ হবে
         if year and tmdb_type == "movie":
             search_url += f"&year={year}"
 
         data = requests.get(search_url, timeout=5).json()
         if data.get("results"):
             res = data["results"][0]
+            m_id = res.get("id")
+            
+            # --- Fetch Extra Details (Credits, Videos) ---
+            details_url = f"https://api.themoviedb.org/3/{tmdb_type}/{m_id}?api_key={TMDB_API_KEY}&append_to_response=credits,videos"
+            extra = requests.get(details_url, timeout=5).json()
+
+            # Extract Trailer
+            trailer_key = None
+            if extra.get('videos', {}).get('results'):
+                for vid in extra['videos']['results']:
+                    if vid['type'] == 'Trailer' and vid['site'] == 'YouTube':
+                        trailer_key = vid['key']
+                        break
+            
+            # Extract Cast
+            cast_list = []
+            if extra.get('credits', {}).get('cast'):
+                for actor in extra['credits']['cast'][:6]:
+                    cast_list.append({
+                        'name': actor['name'],
+                        'img': f"https://image.tmdb.org/t/p/w185{actor['profile_path']}" if actor.get('profile_path') else None
+                    })
+
+            # Genres & Runtime
+            genres = [g['name'] for g in extra.get('genres', [])]
+            runtime = extra.get("runtime") or (extra.get("episode_run_time")[0] if extra.get("episode_run_time") else None)
+
             poster = f"https://image.tmdb.org/t/p/w500{res['poster_path']}" if res.get('poster_path') else None
             backdrop = f"https://image.tmdb.org/t/p/w1280{res['backdrop_path']}" if res.get('backdrop_path') else None
+
             return {
                 "tmdb_id": res.get("id"),
                 "title": res.get("name") if tmdb_type == "tv" else res.get("title"),
@@ -156,7 +176,11 @@ def get_tmdb_details(title, content_type="movie", year=None):
                 "poster": poster,
                 "backdrop": backdrop,
                 "release_date": res.get("first_air_date") if tmdb_type == "tv" else res.get("release_date"),
-                "vote_average": res.get("vote_average")
+                "vote_average": res.get("vote_average"),
+                "genres": genres,        
+                "runtime": runtime, 
+                "trailer": trailer_key,  
+                "cast": cast_list
             }
     except Exception as e:
         print(f"TMDB Error: {e}")
@@ -184,6 +208,12 @@ def inject_globals():
 def telegram_webhook():
     update = request.get_json()
     if not update: return jsonify({'status': 'ignored'})
+
+    # ==========================================
+    # 🔴 আপনার চ্যানেলের লিংক এখানে বসান
+    # ==========================================
+    MY_CHANNEL_LINK = "https://t.me/MovieZone_Official" 
+    # ==========================================
 
     if 'channel_post' in update:
         msg = update['channel_post']
@@ -215,33 +245,25 @@ def telegram_webhook():
         raw_caption = msg.get('caption')
         raw_input = raw_caption if raw_caption else file_name
         
-        # ১. টাইটেল ক্লিন করা (নতুন ফাংশন দিয়ে)
         search_title = clean_filename(raw_input) 
-
-        # ২. সাল বের করা (TMDB তে সঠিক রেজাল্ট পেতে সাহায্য করবে)
         year_match = re.search(r'\b(19|20)\d{2}\b', raw_input)
         search_year = year_match.group(0) if year_match else None
         
-        # ৩. কন্টেন্ট টাইপ নির্ধারণ
         content_type = "movie"
         if re.search(r'(S\d+|Season|Episode|Ep\s*\d+|Combined|E\d+-E\d+)', file_name, re.IGNORECASE) or re.search(r'(S\d+|Season)', str(raw_caption), re.IGNORECASE):
             content_type = "series"
 
-        # ৪. TMDB ডিটেইলস (সাল সহ কল করা হচ্ছে)
         tmdb_data = get_tmdb_details(search_title, content_type, search_year)
         final_title = tmdb_data.get('title', search_title)
         quality = get_file_quality(file_name)
         
-        # ৫. এপিসোড লেবেল
         episode_label = get_episode_label(file_name)
         if content_type == "series" and not episode_label:
             clean_part = file_name.replace(search_title, "").replace(".", " ").strip()
             if len(clean_part) > 3:
                 episode_label = clean_part[:25]
 
-        # ৬. ল্যাঙ্গুয়েজ ডিটেকশন
         language = detect_language(raw_input)
-
         unique_code = str(uuid.uuid4())[:8]
 
         file_obj = {
@@ -260,21 +282,26 @@ def telegram_webhook():
         should_notify = False
 
         if existing_movie:
-            if content_type == "series" and episode_label:
-                is_duplicate = False
-                for f in existing_movie.get('files', []):
-                    if f.get('episode_label') == episode_label and f.get('quality') == quality:
-                        is_duplicate = True
-                        break
-                should_notify = not is_duplicate
-            else:
-                should_notify = False
-
-            movies.update_one(
-                {"_id": existing_movie['_id']},
-                {"$push": {"files": file_obj}, "$set": {"updated_at": datetime.utcnow()}}
-            )
-            movie_id = existing_movie['_id']
+            is_duplicate = False
+            for f in existing_movie.get('files', []):
+                if f.get('file_id') == file_id:
+                    is_duplicate = True
+                    break
+            if not is_duplicate:
+                movies.update_one(
+                    {"_id": existing_movie['_id']},
+                    {"$push": {"files": file_obj}, "$set": {"updated_at": datetime.utcnow()}}
+                )
+                movie_id = existing_movie['_id']
+                if content_type == "series" and episode_label:
+                    has_ep = False
+                    for f in existing_movie.get('files', []):
+                        if f.get('episode_label') == episode_label and f.get('quality') == quality and f != file_obj:
+                            has_ep = True
+                            break
+                    should_notify = not has_ep
+                else:
+                    should_notify = False
         else:
             should_notify = True
             new_movie = {
@@ -284,8 +311,13 @@ def telegram_webhook():
                 "backdrop": tmdb_data.get('backdrop'),
                 "release_date": tmdb_data.get('release_date'),
                 "vote_average": tmdb_data.get('vote_average'),
+                "genres": tmdb_data.get('genres'),
+                "runtime": tmdb_data.get('runtime'),
+                "trailer": tmdb_data.get('trailer'),
+                "cast": tmdb_data.get('cast'),
                 "language": language,
                 "type": content_type,
+                "category": "Uncategorized",
                 "files": [file_obj],
                 "created_at": datetime.utcnow(),
                 "updated_at": datetime.utcnow()
@@ -293,22 +325,24 @@ def telegram_webhook():
             res = movies.insert_one(new_movie)
             movie_id = res.inserted_id
 
-        # --- Notification Logic ---
         if movie_id and WEBSITE_URL:
-            dl_link = f"{WEBSITE_URL.rstrip('/')}/movie/{str(movie_id)}"
+            # সোর্স চ্যানেলের জন্য ডিরেক্ট লিংক (যাতে এডমিন চেক করতে পারে)
+            direct_link = f"{WEBSITE_URL.rstrip('/')}/movie/{str(movie_id)}"
+            # পাবলিক চ্যানেলের জন্য হোম লিংক
+            home_link = WEBSITE_URL.rstrip('/')
             
-            # Source Channel Button Update
+            # --- SOURCE CHANNEL BUTTON (Direct Link) ---
             edit_payload = {
                 'chat_id': chat_id,
                 'message_id': msg['message_id'],
                 'reply_markup': json.dumps({
-                    "inline_keyboard": [[{"text": "▶️ Download from Website", "url": dl_link}]]
+                    "inline_keyboard": [[{"text": "▶️ Check on Website", "url": direct_link}]]
                 })
             }
             try: requests.post(f"{TELEGRAM_API_URL}/editMessageReplyMarkup", json=edit_payload)
             except: pass
 
-            # Public Channel Notification
+            # --- PUBLIC CHANNEL NOTIFICATION (Home Link) ---
             if PUBLIC_CHANNEL_ID and should_notify:
                 notify_caption = f"🎬 *{escape_markdown(final_title)}*\n"
                 if episode_label: notify_caption += f"📌 {escape_markdown(episode_label)}\n"
@@ -318,12 +352,17 @@ def telegram_webhook():
                 notify_caption += f"🔊 Language: {language}\n"
                 notify_caption += f"💿 Quality: {quality}\n"
                 notify_caption += f"📦 Size: {file_size_mb:.2f} MB\n\n"
-                notify_caption += f"🔗 *Download Now:* [Click Here]({dl_link})"
+                notify_caption += f"🔗 *Download Now:* [Click Here]({home_link})"
+
+                pub_keyboard = [
+                    [{"text": "📥 Download / Watch Online", "url": home_link}],
+                    [{"text": "📢 Join Our Channel", "url": MY_CHANNEL_LINK}]
+                ]
 
                 notify_payload = {
                     'chat_id': PUBLIC_CHANNEL_ID,
                     'parse_mode': 'Markdown',
-                    'reply_markup': json.dumps({"inline_keyboard": [[{"text": "📥 Download / Watch Online", "url": dl_link}]]})
+                    'reply_markup': json.dumps({"inline_keyboard": pub_keyboard})
                 }
 
                 if tmdb_data.get('poster'):
@@ -338,6 +377,7 @@ def telegram_webhook():
 
         return jsonify({'status': 'success'})
 
+    # --- USER MESSAGE HANDLING ---
     elif 'message' in update:
         msg = update['message']
         chat_id = msg.get('chat', {}).get('id')
@@ -351,25 +391,55 @@ def telegram_webhook():
                 if movie:
                     target_file = next((f for f in movie['files'] if f['unique_code'] == code), None)
                     if target_file:
+                        # ক্যাপশনে ১০ মিনিটের ওয়ার্নিং অ্যাড করা হয়েছে
                         caption = f"🎬 *{escape_markdown(movie['title'])}*\n"
                         if target_file.get('episode_label'):
                             caption += f"📌 {escape_markdown(target_file['episode_label'])}\n"
-                        caption += f"🔊 Audio: {movie.get('language', 'N/A')}\n"
                         caption += f"💿 Quality: {target_file['quality']}\n"
                         caption += f"📦 Size: {target_file['size']}\n\n"
-                        caption += f"✅ *Downloaded from {escape_markdown(WEBSITE_URL)}*"
+                        caption += f"⚠️ *File will be deleted in 10 minutes! Forward it now!*"
                         
-                        payload = {'chat_id': chat_id, 'caption': caption, 'parse_mode': 'Markdown'}
+                        file_keyboard = {
+                            "inline_keyboard": [
+                                [{"text": "📢 Join Update Channel", "url": MY_CHANNEL_LINK}]
+                            ]
+                        }
+
+                        payload = {
+                            'chat_id': chat_id, 
+                            'caption': caption, 
+                            'parse_mode': 'Markdown',
+                            'reply_markup': json.dumps(file_keyboard)
+                        }
+                        
                         method = 'sendVideo' if target_file['file_type'] == 'video' else 'sendDocument'
                         if target_file['file_type'] == 'video': payload['video'] = target_file['file_id']
                         else: payload['document'] = target_file['file_id']
-                        requests.post(f"{TELEGRAM_API_URL}/{method}", json=payload)
+                        
+                        # --- ফাইল সেন্ড এবং অটো ডিলিট প্রসেস ---
+                        try:
+                            response = requests.post(f"{TELEGRAM_API_URL}/{method}", json=payload)
+                            resp_data = response.json()
+                            
+                            if resp_data.get('ok'):
+                                sent_msg_id = resp_data['result']['message_id']
+                                # আলাদা থ্রেডে ১০ মিনিট অপেক্ষার জন্য পাঠানো হচ্ছে
+                                threading.Thread(target=delete_message_later, args=(chat_id, sent_msg_id, DELETE_TIMEOUT)).start()
+                        except Exception as e:
+                            print(f"Error sending file: {e}")
                     else:
-                        requests.post(f"{TELEGRAM_API_URL}/sendMessage", json={'chat_id': chat_id, 'text': "❌ File expired."})
+                        requests.post(f"{TELEGRAM_API_URL}/sendMessage", json={'chat_id': chat_id, 'text': "❌ File expired or removed."})
                 else:
                     requests.post(f"{TELEGRAM_API_URL}/sendMessage", json={'chat_id': chat_id, 'text': "❌ Invalid Link."})
             else:
-                requests.post(f"{TELEGRAM_API_URL}/sendMessage", json={'chat_id': chat_id, 'text': "👋 Welcome! Use the website to download movies."})
+                welcome_kb = {
+                    "inline_keyboard": [[{"text": "📢 Join Our Channel", "url": MY_CHANNEL_LINK}]]
+                }
+                requests.post(f"{TELEGRAM_API_URL}/sendMessage", json={
+                    'chat_id': chat_id, 
+                    'text': "👋 Welcome! Use the website to download movies.",
+                    'reply_markup': json.dumps(welcome_kb)
+                })
 
     return jsonify({'status': 'ok'})
 
@@ -384,72 +454,124 @@ index_template = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>{{ site_name }} - Home</title>
+    <!-- CSS & Icons -->
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <!-- Swiper CSS -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/swiper@11/swiper-bundle.min.css" />
+
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap');
-        :root { --primary: #E50914; --dark: #0f0f0f; --card-bg: #1a1a1a; --text: #fff; }
+        @import url('https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@400;500;600;700&display=swap');
+        
+        :root { --primary: #E50914; --dark: #0f1012; --card-bg: #1a1a1a; --text: #fff; --red-btn: #cc0000; --blue-badge: #0084ff; }
         * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Poppins', sans-serif; -webkit-tap-highlight-color: transparent; }
         body { background-color: var(--dark); color: var(--text); padding-bottom: 70px; }
         a { text-decoration: none; color: inherit; }
         
-        .navbar { display: flex; justify-content: space-between; align-items: center; padding: 12px 15px; background: rgba(0,0,0,0.8); backdrop-filter: blur(10px); position: sticky; top: 0; z-index: 100; border-bottom: 1px solid #222; }
-        .logo { font-size: 20px; font-weight: 700; color: var(--primary); text-transform: uppercase; }
-        .search-box { position: relative; }
-        .search-box input { background: #222; border: 1px solid #333; padding: 8px 15px; padding-right: 35px; border-radius: 20px; color: #fff; outline: none; width: 140px; font-size: 13px; transition: width 0.3s; }
-        .search-box input:focus { width: 180px; border-color: var(--primary); }
-        .search-box i { position: absolute; right: 12px; top: 50%; transform: translateY(-50%); color: #777; font-size: 12px; pointer-events: none; }
+        .navbar { display: flex; justify-content: space-between; align-items: center; padding: 12px 15px; background: #161616; border-bottom: 1px solid #222; position: sticky; top: 0; z-index: 100; }
+        .logo { font-size: 22px; font-weight: 800; color: var(--primary); text-transform: uppercase; letter-spacing: 1px; }
+        .nav-icons { color: #fff; font-size: 18px; }
 
-        .hero { height: 280px; background-size: cover; background-position: center; position: relative; display: flex; align-items: flex-end; margin-bottom: 20px; }
-        .hero::after { content: ''; position: absolute; inset: 0; background: linear-gradient(to top, var(--dark) 0%, transparent 100%); }
-        .hero-content { position: relative; z-index: 2; padding: 20px; width: 100%; }
-        .hero-title { font-size: 1.8rem; line-height: 1.2; text-shadow: 0 2px 4px rgba(0,0,0,0.8); margin-bottom: 5px; }
-        .btn-play { background: var(--primary); border: none; padding: 8px 20px; border-radius: 4px; color: #fff; font-weight: 600; font-size: 0.9rem; display: inline-flex; align-items: center; gap: 8px; margin-top: 10px; }
+        .category-container { padding: 10px; background: #121212; display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; }
+        .cat-btn { background: var(--red-btn); color: white; padding: 6px 10px; border-radius: 6px; font-size: 12px; font-weight: 700; text-transform: uppercase; display: inline-flex; align-items: center; gap: 5px; border: 1px solid #990000; box-shadow: 0 3px 0 #800000; transition: 0.1s; white-space: nowrap; }
+        .cat-btn:active { transform: translateY(3px); box-shadow: none; }
+        .cat-btn.active { background: #ffcc00; color: #000; border-color: #cc9900; box-shadow: 0 3px 0 #997700; }
+
+        .search-wrapper { padding: 5px 15px 15px 15px; background: #121212; display: flex; justify-content: center; }
+        .big-search-box { width: 100%; max-width: 600px; display: flex; background: #1e252b; border: 2px solid #00c3ff; border-radius: 8px; overflow: hidden; }
+        .big-search-box input { flex: 1; background: transparent; border: none; padding: 10px 15px; color: #fff; font-family: 'Hind Siliguri', sans-serif; font-size: 15px; outline: none; }
+        .big-search-box button { background: #00c3ff; border: none; width: 50px; cursor: pointer; color: #fff; font-size: 18px; }
+
+        /* HERO SLIDER */
+        .slider-section { padding: 10px 15px; margin-bottom: 10px; }
+        .swiper { width: 100%; height: 200px; border-radius: 8px; overflow: hidden; }
+        @media (min-width: 600px) { .swiper { height: 320px; } }
+        .swiper-slide { position: relative; background: #000; display: flex; align-items: flex-end; }
+        .slide-img { width: 100%; height: 100%; object-fit: cover; opacity: 0.8; }
+        .slide-overlay { position: absolute; inset: 0; background: linear-gradient(to top, rgba(0,0,0,1) 0%, rgba(0,0,0,0.6) 40%, transparent 100%); pointer-events: none; }
+        .slide-content { position: absolute; bottom: 0; left: 0; width: 100%; padding: 15px; z-index: 10; padding-right: 90px; }
+        .slide-title { font-size: 1.4rem; font-weight: 700; line-height: 1.2; text-shadow: 0 2px 4px rgba(0,0,0,0.8); margin-bottom: 5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-transform: uppercase; }
+        .slide-meta { font-size: 0.9rem; color: #ccc; font-weight: 500; }
+        .type-badge { position: absolute; bottom: 0; right: 0; background: var(--blue-badge); color: #fff; padding: 6px 15px; font-weight: 700; font-size: 0.85rem; text-transform: uppercase; border-top-left-radius: 8px; z-index: 20; }
+        .swiper-pagination-bullet { background: #888; opacity: 1; width: 8px; height: 8px; }
+        .swiper-pagination-bullet-active { background: #fff; width: 20px; border-radius: 4px; }
 
         .section { padding: 0 15px; }
-        .section-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 15px; }
-        .section-title { font-size: 1.1rem; border-left: 3px solid var(--primary); padding-left: 10px; font-weight: 600; }
+        .section-header { margin-bottom: 15px; border-left: 4px solid var(--primary); padding-left: 10px; }
+        .section-title { font-size: 1.1rem; font-weight: 700; text-transform: uppercase; }
 
-        .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
-        @media (min-width: 600px) { .grid { grid-template-columns: repeat(4, 1fr); gap: 15px; } }
-        @media (min-width: 900px) { .grid { grid-template-columns: repeat(6, 1fr); gap: 20px; } }
+        .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+        @media (min-width: 600px) { .grid { grid-template-columns: repeat(3, 1fr); gap: 15px; } }
+        @media (min-width: 900px) { .grid { grid-template-columns: repeat(5, 1fr); gap: 20px; } }
 
-        .card { position: relative; background: var(--card-bg); border-radius: 6px; overflow: hidden; aspect-ratio: 2/3; }
+        .card { position: relative; background: var(--card-bg); border-radius: 6px; overflow: hidden; aspect-ratio: 2/3; transition: transform 0.2s; }
         .card-img { width: 100%; height: 100%; object-fit: cover; }
-        .card-overlay { position: absolute; inset: 0; background: linear-gradient(to top, rgba(0,0,0,0.9) 0%, transparent 60%); display: flex; flex-direction: column; justify-content: flex-end; padding: 8px; }
-        .card-title { font-size: 0.8rem; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.2; }
-        .card-meta { font-size: 0.7rem; color: #ccc; margin-top: 2px; display: flex; justify-content: space-between; }
-        
-        .rating-badge { position: absolute; top: 6px; left: 6px; background: rgba(0,0,0,0.7); color: #ffb400; padding: 2px 5px; border-radius: 3px; font-size: 0.65rem; font-weight: bold; backdrop-filter: blur(4px); }
-        .lang-badge { position: absolute; top: 6px; right: 6px; background: var(--primary); color: #fff; padding: 2px 6px; border-radius: 3px; font-size: 0.6rem; font-weight: 600; text-transform: uppercase; box-shadow: 0 2px 4px rgba(0,0,0,0.3); }
+        .card-overlay { position: absolute; inset: 0; background: linear-gradient(to top, rgba(0,0,0,0.95) 0%, transparent 60%); display: flex; flex-direction: column; justify-content: flex-end; padding: 10px; }
+        .card-title { font-size: 0.85rem; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .card-meta { font-size: 0.75rem; color: #ccc; display: flex; justify-content: space-between; }
+        .rating-badge { position: absolute; top: 6px; left: 6px; background: rgba(0,0,0,0.7); color: #ffb400; padding: 2px 5px; border-radius: 3px; font-size: 0.65rem; font-weight: bold; }
 
-        .bottom-nav { position: fixed; bottom: 0; width: 100%; background: #161616; display: flex; justify-content: space-around; padding: 10px 0; border-top: 1px solid #252525; z-index: 99; backdrop-filter: blur(10px); }
-        .nav-item { display: flex; flex-direction: column; align-items: center; color: #777; font-size: 10px; transition: 0.2s; }
-        .nav-item i { font-size: 18px; margin-bottom: 4px; }
+        .pagination { display: flex; justify-content: center; gap: 10px; margin: 30px 0; }
+        .page-btn { padding: 8px 16px; background: #222; border-radius: 4px; color: #fff; font-size: 0.9rem; border: 1px solid #333; }
+
+        .bottom-nav { position: fixed; bottom: 0; width: 100%; background: #161616; display: flex; justify-content: space-around; padding: 10px 0; border-top: 1px solid #252525; z-index: 99; }
+        .nav-item { display: flex; flex-direction: column; align-items: center; color: #777; font-size: 10px; }
         .nav-item.active { color: var(--primary); }
-        
-        .ad-container { margin: 15px 0; text-align: center; min-height: 50px; background: #111; border-radius: 4px; overflow: hidden; }
+        .ad-container { margin: 15px 0; text-align: center; overflow: hidden; }
     </style>
 </head>
 <body>
 
 <nav class="navbar">
     <a href="/" class="logo">{{ site_name }}</a>
-    <form action="/" method="GET" class="search-box">
-        <input type="text" name="q" placeholder="Search..." value="{{ query }}">
-        <i class="fas fa-search"></i>
-    </form>
+    <div class="nav-icons"><i class="fas fa-bell"></i></div>
 </nav>
 
-{% if not query and featured %}
-<div class="hero" style="background-image: url('{{ featured.backdrop or featured.poster }}');">
-    <div class="hero-content">
-        <h1 class="hero-title">{{ featured.title }}</h1>
-        <div style="font-size: 0.8rem; color: #ddd; margin-bottom: 5px;">
-            <i class="fas fa-star" style="color: #ffb400;"></i> {{ featured.vote_average }} | {{ featured.language }}
+<div class="category-container">
+    <!-- Updated Links: Using query params (?type=...) directly -->
+    <a href="/" class="cat-btn {{ 'active' if not selected_cat and not request.args.get('type') else '' }}">🏠 Home</a>
+    
+    <a href="/?type=movie" class="cat-btn {{ 'active' if request.args.get('type') == 'movie' else '' }}">
+        <i class="fas fa-film"></i> All Movies
+    </a>
+    
+    <a href="/?type=series" class="cat-btn {{ 'active' if request.args.get('type') == 'series' else '' }}">
+        <i class="fas fa-tv"></i> All Web Series
+    </a>
+
+    {% for cat in categories %}
+    <a href="/?cat={{ cat.name }}" class="cat-btn {{ 'active' if selected_cat == cat.name else '' }}">
+        {% if 'Bangla' in cat.name %}🇧🇩{% elif 'Hindi' in cat.name %}🇮🇳{% elif 'English' in cat.name %}🇺🇸{% else %}<i class="fas fa-tag"></i>{% endif %} {{ cat.name }}
+    </a>
+    {% endfor %}
+</div>
+
+<div class="search-wrapper">
+    <form action="/" method="GET" class="big-search-box">
+        <input type="text" name="q" placeholder="সার্চ করে খুঁজে নিন পছন্দের মুভি..." value="{{ query }}">
+        <button type="submit"><i class="fas fa-search"></i></button>
+    </form>
+</div>
+
+{% if slider_movies %}
+<div class="slider-section">
+    <div class="swiper mySwiper">
+        <div class="swiper-wrapper">
+            {% for slide in slider_movies %}
+            <div class="swiper-slide">
+                <a href="{{ url_for('movie_detail', movie_id=slide._id) }}" style="width:100%; height:100%; position:relative;">
+                    <img src="{{ slide.backdrop or slide.poster }}" class="slide-img">
+                    <div class="slide-overlay"></div>
+                    <div class="slide-content">
+                        <h2 class="slide-title">{{ slide.title }}</h2>
+                        <div class="slide-meta">{{ (slide.release_date or '')[:4] }} • {{ slide.language }}</div>
+                    </div>
+                    <div class="type-badge">{{ slide.type|upper if slide.type else 'MOVIE' }}</div>
+                </a>
+            </div>
+            {% endfor %}
         </div>
-        <a href="{{ url_for('movie_detail', movie_id=featured._id) }}" class="btn-play">
-            <i class="fas fa-play"></i> Watch Now
-        </a>
+        <div class="swiper-pagination"></div>
     </div>
 </div>
 {% endif %}
@@ -458,41 +580,67 @@ index_template = """
     {% if ad_settings.banner_ad %}<div class="ad-container">{{ ad_settings.banner_ad|safe }}</div>{% endif %}
 
     <div class="section-header">
-        <h2 class="section-title">{{ query and 'Search Results' or 'Latest Uploads' }}</h2>
+        <h2 class="section-title">
+            {% if request.args.get('type') == 'movie' %} All Movies
+            {% elif request.args.get('type') == 'series' %} All Web Series
+            {% elif selected_cat %} {{ selected_cat }}
+            {% elif query %} Search Results
+            {% else %} Latest Uploads {% endif %}
+        </h2>
     </div>
 
     <div class="grid">
         {% for movie in movies %}
         <a href="{{ url_for('movie_detail', movie_id=movie._id) }}" class="card">
             <span class="rating-badge">{{ movie.vote_average }}</span>
-            {% if movie.language %}<span class="lang-badge">{{ movie.language }}</span>{% endif %}
-            <img src="{{ movie.poster or 'https://via.placeholder.com/300x450?text=No+Poster' }}" class="card-img" loading="lazy">
+            <img src="{{ movie.poster or 'https://via.placeholder.com/300x450' }}" class="card-img" loading="lazy">
             <div class="card-overlay">
                 <h3 class="card-title">{{ movie.title }}</h3>
                 <div class="card-meta">
-                    <span>{{ (movie.release_date or 'N/A')[:4] }}</span>
-                    <span>{{ movie.type|capitalize }}</span>
+                    <span>{{ (movie.release_date or '')[:4] }}</span>
+                    <span>{{ movie.category or 'Movie' }}</span>
                 </div>
             </div>
         </a>
         {% endfor %}
     </div>
-    
+
+    <!-- Pagination maintains type filters -->
+    <div class="pagination">
+        {% if page > 1 %}
+        <a href="/?page={{ page-1 }}&type={{ request.args.get('type') or '' }}&cat={{ selected_cat or '' }}&q={{ query or '' }}" class="page-btn">Previous</a>
+        {% endif %}
+        {% if has_next %}
+        <a href="/?page={{ page+1 }}&type={{ request.args.get('type') or '' }}&cat={{ selected_cat or '' }}&q={{ query or '' }}" class="page-btn">Next</a>
+        {% endif %}
+    </div>
     <div style="height: 20px;"></div>
 </main>
 
 <nav class="bottom-nav">
     <a href="/" class="nav-item {{ 'active' if not request.args.get('type') else '' }}"><i class="fas fa-home"></i>Home</a>
-    <a href="/movies" class="nav-item {{ 'active' if request.args.get('type') == 'movie' else '' }}"><i class="fas fa-film"></i>Movies</a>
-    <a href="/series" class="nav-item {{ 'active' if request.args.get('type') == 'series' else '' }}"><i class="fas fa-tv"></i>Series</a>
+    <a href="/?type=movie" class="nav-item {{ 'active' if request.args.get('type') == 'movie' else '' }}"><i class="fas fa-film"></i>Movies</a>
+    <a href="/?type=series" class="nav-item {{ 'active' if request.args.get('type') == 'series' else '' }}"><i class="fas fa-tv"></i>Series</a>
 </nav>
 
 {% if ad_settings.popunder %}{{ ad_settings.popunder|safe }}{% endif %}
+
+<script src="https://cdn.jsdelivr.net/npm/swiper@11/swiper-bundle.min.js"></script>
+<script>
+    var swiper = new Swiper(".mySwiper", {
+        spaceBetween: 15,
+        centeredSlides: true,
+        autoplay: { delay: 3500, disableOnInteraction: false },
+        pagination: { el: ".swiper-pagination", clickable: true, dynamicBullets: true },
+        loop: true
+    });
+</script>
 
 </body>
 </html>
 """
 
+# --- DETAIL TEMPLATE (Fixed Cast & Trailer) ---
 detail_template = """
 <!DOCTYPE html>
 <html lang="en">
@@ -516,7 +664,7 @@ detail_template = """
         .poster-box img { width: 100%; display: block; }
         
         h1 { font-size: 1.6rem; margin-bottom: 5px; line-height: 1.2; }
-        .meta-tags { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-bottom: 15px; font-size: 0.8rem; color: #bbb; }
+        .meta-tags { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-bottom: 8px; font-size: 0.8rem; color: #bbb; }
         .tag { background: #333; padding: 3px 8px; border-radius: 4px; }
         .overview { font-size: 0.9rem; line-height: 1.6; color: #ccc; margin-bottom: 25px; text-align: justify; }
         
@@ -544,9 +692,16 @@ detail_template = """
             transition: 0.3s;
         }
         .btn-dl:hover { background: #0077b5; transform: translateY(-2px); }
-        
+
+        .badge-q { padding: 3px 8px; border-radius: 4px; font-size: 0.7rem; font-weight: bold; }
+        .q-4k { background: #d63384; color: #fff; box-shadow: 0 0 10px rgba(214, 51, 132, 0.5); }
+        .q-1080p { background: #6f42c1; color: #fff; }
+        .q-720p { background: #0d6efd; color: #fff; }
+        .q-480p { background: #198754; color: #fff; }
+
         @media (min-width: 600px) {
             .movie-info { flex-direction: row; text-align: left; align-items: flex-end; padding: 0 20px; }
+            .meta-tags { justify-content: flex-start; }
             .overview { text-align: left; padding: 0 20px; }
             .backdrop { height: 350px; margin-bottom: -100px; }
             .poster-box { width: 180px; }
@@ -571,8 +726,14 @@ detail_template = """
             <div class="meta-tags">
                 <span class="tag"><i class="fas fa-star" style="color:#ffb400"></i> {{ movie.vote_average }}</span>
                 <span class="tag">{{ (movie.release_date or 'N/A')[:4] }}</span>
+                {% if movie.runtime %}<span class="tag"><i class="far fa-clock"></i> {{ movie.runtime }} min</span>{% endif %}
                 <span class="tag" style="background: var(--primary); color: #fff;">{{ movie.language or 'Eng' }}</span>
-                <span class="tag">{{ movie.type|upper }}</span>
+                <span class="tag">{{ movie.category or 'Movie' }}</span>
+            </div>
+            <div style="margin-top:5px; font-size: 0.85rem; color: #aaa;">
+                {% if movie.genres %}
+                    {{ movie.genres|join(', ') }}
+                {% endif %}
             </div>
         </div>
     </div>
@@ -580,7 +741,46 @@ detail_template = """
     <div style="height: 20px;"></div>
     <p class="overview">{{ movie.overview }}</p>
 
+    <!-- Trailer Section -->
+    {% if movie.trailer %}
+    <div style="margin-bottom: 25px; padding: 0 5px;">
+        <div class="section-head"><i class="fab fa-youtube"></i> Watch Trailer</div>
+        <div style="position: relative; padding-bottom: 56.25%; height: 0; overflow: hidden; border-radius: 8px; border: 1px solid #333;">
+            <iframe style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; border:0;" 
+                    src="https://www.youtube.com/embed/{{ movie.trailer }}" allowfullscreen></iframe>
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- Cast Section -->
+    {% if movie.cast %}
+    <div style="margin-bottom: 25px; padding: 0 5px;">
+        <div class="section-head"><i class="fas fa-users"></i> Top Cast</div>
+        <div style="display: flex; gap: 15px; overflow-x: auto; padding-bottom: 10px; scrollbar-width: none;">
+            {% for actor in movie.cast %}
+            <div style="min-width: 90px; text-align: center;">
+                <img src="{{ actor.img or 'https://via.placeholder.com/90x90?text=No+Img' }}" 
+                     style="width: 80px; height: 80px; border-radius: 50%; object-fit: cover; border: 2px solid #333; margin-bottom: 5px;">
+                <div style="font-size: 0.75rem; color: #ccc; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{{ actor.name }}</div>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+    {% endif %}
+
     {% if ad_settings.banner_ad %}<div style="margin: 20px 0; text-align:center;">{{ ad_settings.banner_ad|safe }}</div>{% endif %}
+
+    <div style="display: flex; gap: 10px; margin-bottom: 20px;">
+        <a href="whatsapp://send?text=Download {{ movie.title }} - {{ request.url }}" class="btn-dl" style="background: #25D366; flex: 1; margin:0;">
+            <i class="fab fa-whatsapp"></i> Share
+        </a>
+        <a href="https://www.facebook.com/sharer/sharer.php?u={{ request.url }}" target="_blank" class="btn-dl" style="background: #1877F2; flex: 1; margin:0;">
+            <i class="fab fa-facebook-f"></i> Share
+        </a>
+        <button onclick="navigator.clipboard.writeText(window.location.href); alert('Link Copied!')" class="btn-dl" style="background: #333; flex: 1; margin:0;">
+            <i class="fas fa-link"></i> Copy
+        </button>
+    </div>
 
     <div class="file-section">
         <div class="section-head"><i class="fas fa-download"></i> Download Links</div>
@@ -590,7 +790,12 @@ detail_template = """
                 <div class="file-details">
                     {% if file.episode_label %}
                         <h4 style="color: #ffb400; font-weight: 700;">{{ file.episode_label }}</h4>
-                        <span style="color: #fff;">{{ file.quality }}</span>
+                        {% set q_class = 'q-480p' %}
+                        {% if '1080p' in file.quality %} {% set q_class = 'q-1080p' %}
+                        {% elif '720p' in file.quality %} {% set q_class = 'q-720p' %}
+                        {% elif '4K' in file.quality %} {% set q_class = 'q-4k' %}
+                        {% endif %}
+                        <span class="badge-q {{ q_class }}">{{ file.quality }}</span>
                     {% else %}
                         <h4>{{ file.quality }}</h4>
                     {% endif %}
@@ -598,7 +803,6 @@ detail_template = """
                     <div style="font-size: 0.75rem; color: #888; margin-top: 3px;">
                         Size: {{ file.size }} • Format: {{ file.file_type|upper }}
                     </div>
-                    <!-- ফাইলের আসল নামটা ছোট করে নিচে দেখানো -->
                     <div style="font-size: 0.65rem; color: #555; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 250px;">
                         {{ file.filename }}
                     </div>
@@ -667,6 +871,7 @@ admin_base = """
 <div class="sidebar">
     <div class="brand"><i class="fas fa-play-circle"></i> <span>Admin</span></div>
     <a href="/admin" class="{{ 'active' if active == 'dashboard' else '' }}"><i class="fas fa-th-large"></i> <span>Movies</span></a>
+    <a href="/admin/categories" class="{{ 'active' if active == 'categories' else '' }}"><i class="fas fa-tags"></i> <span>Categories</span></a>
     <a href="/admin/settings" class="{{ 'active' if active == 'settings' else '' }}"><i class="fas fa-cogs"></i> <span>Settings</span></a>
     <a href="/" target="_blank"><i class="fas fa-external-link-alt"></i> <span>View Site</span></a>
 </div>
@@ -745,7 +950,8 @@ admin_dashboard = """
                 <div class="col-8">
                     <div class="card-body p-2 d-flex flex-column h-100">
                         <h6 class="card-title mb-1 text-truncate">{{ movie.title }}</h6>
-                        <p class="card-text small text-muted mb-1">{{ (movie.release_date or '')[:4] }} • {{ movie.language }}</p>
+                        <span class="badge bg-danger mb-1">{{ movie.category }}</span>
+                        <p class="card-text small text-muted mb-1">{{ (movie.release_date or '')[:4] }}</p>
                         <div class="mt-auto d-flex gap-2">
                             <a href="/admin/movie/edit/{{ movie._id }}" class="btn btn-sm btn-primary flex-grow-1">Edit</a>
                             <a href="/admin/movie/delete/{{ movie._id }}" onclick="return confirm('Are you sure?')" class="btn btn-sm btn-danger"><i class="fas fa-trash"></i></a>
@@ -767,10 +973,33 @@ admin_dashboard = """
 </div>
 """
 
+# --- NEW CATEGORY MANAGEMENT TEMPLATE ---
+admin_categories = """
+<div class="container" style="max-width: 600px;">
+    <h3 class="mb-4">Manage Categories</h3>
+    
+    <div class="card p-3 mb-4">
+        <form method="POST" class="d-flex gap-2">
+            <input type="text" name="new_category" class="form-control" placeholder="New Category Name (e.g. Bollywood)" required>
+            <button class="btn btn-success" type="submit">Add</button>
+        </form>
+    </div>
+
+    <div class="list-group">
+        {% for cat in categories %}
+        <div class="list-group-item d-flex justify-content-between align-items-center bg-dark text-white border-secondary">
+            <span>{{ cat.name }}</span>
+            <a href="/admin/categories/delete/{{ cat._id }}" class="btn btn-sm btn-danger"><i class="fas fa-trash"></i></a>
+        </div>
+        {% endfor %}
+    </div>
+</div>
+"""
+
 admin_edit = """
 <div class="container-fluid">
     <div class="d-flex justify-content-between align-items-center mb-4">
-        <h3>Edit Movie: <span class="text-primary">{{ movie.title }}</span></h3>
+        <h3>Edit Content: <span class="text-primary">{{ movie.title }}</span></h3>
         <a href="/admin" class="btn btn-secondary btn-sm">Back</a>
     </div>
 
@@ -780,7 +1009,7 @@ admin_edit = """
             <div class="card p-3">
                 <h5>Fetch Data from TMDB</h5>
                 <div class="input-group mb-3">
-                    <input type="text" id="tmdbQuery" class="form-control" placeholder="Enter Movie Name..." value="{{ movie.title }}">
+                    <input type="text" id="tmdbQuery" class="form-control" placeholder="Enter Name..." value="{{ movie.title }}">
                     <button class="btn btn-warning" type="button" onclick="searchTMDB()">Search</button>
                 </div>
                 <div id="tmdbResults" style="max-height: 400px; overflow-y: auto;"></div>
@@ -797,13 +1026,31 @@ admin_edit = """
             <div class="card p-4">
                 <form method="POST">
                     <div class="row">
-                        <div class="col-md-8 mb-3">
-                            <label class="form-label">Movie Title</label>
+                        <div class="col-md-12 mb-3">
+                            <label class="form-label">Title</label>
                             <input type="text" name="title" class="form-control" value="{{ movie.title }}" required>
                         </div>
-                        <div class="col-md-4 mb-3">
-                            <label class="form-label">Language (Badge)</label>
-                            <input type="text" name="language" class="form-control" value="{{ movie.language }}" placeholder="e.g. Hindi, Dual Audio">
+                    </div>
+
+                    <div class="row">
+                        <!-- CATEGORY SELECT -->
+                        <div class="col-md-6 mb-3">
+                            <label class="form-label">Category</label>
+                            <select name="category" class="form-select">
+                                <option value="Uncategorized">Select Category...</option>
+                                {% for cat in categories %}
+                                <option value="{{ cat.name }}" {{ 'selected' if movie.category == cat.name else '' }}>{{ cat.name }}</option>
+                                {% endfor %}
+                            </select>
+                        </div>
+
+                        <!-- TYPE SELECT (ADDED THIS) -->
+                        <div class="col-md-6 mb-3">
+                            <label class="form-label">Content Type</label>
+                            <select name="type" class="form-select" style="background-color: #2c3036; color: white; border-color: #444;">
+                                <option value="movie" {{ 'selected' if movie.type == 'movie' else '' }}>Movie</option>
+                                <option value="series" {{ 'selected' if movie.type == 'series' else '' }}>Web Series</option>
+                            </select>
                         </div>
                     </div>
 
@@ -829,19 +1076,16 @@ admin_edit = """
                             <input type="text" name="release_date" class="form-control" value="{{ movie.release_date }}">
                         </div>
                         <div class="col-md-4 mb-3">
-                            <label class="form-label">TMDB Rating</label>
+                            <label class="form-label">Rating</label>
                             <input type="text" name="vote_average" class="form-control" value="{{ movie.vote_average }}">
                         </div>
                         <div class="col-md-4 mb-3">
-                            <label class="form-label">Type</label>
-                            <select name="type" class="form-control">
-                                <option value="movie" {{ 'selected' if movie.type == 'movie' else '' }}>Movie</option>
-                                <option value="series" {{ 'selected' if movie.type == 'series' else '' }}>Series</option>
-                            </select>
+                            <label class="form-label">Language</label>
+                            <input type="text" name="language" class="form-control" value="{{ movie.language }}">
                         </div>
                     </div>
 
-                    <button type="submit" class="btn btn-primary btn-lg w-100">Update Movie Details</button>
+                    <button type="submit" class="btn btn-primary btn-lg w-100">Update Details</button>
                 </form>
             </div>
         </div>
@@ -878,22 +1122,40 @@ admin_settings = """
 
 @app.route('/')
 def home():
+    page = int(request.args.get('page', 1))
+    per_page = 16
     query = request.args.get('q', '').strip()
-    filter_type = request.args.get('type')
+    cat_filter = request.args.get('cat', '').strip()
+    type_filter = request.args.get('type', '').strip() # movie or series
     
     db_query = {}
+    
+    # --- SEARCH LOGIC ---
     if query:
         db_query["title"] = {"$regex": query, "$options": "i"}
-    if filter_type:
-        db_query["type"] = filter_type
-
-    movie_list = list(movies.find(db_query).sort([('updated_at', -1), ('_id', -1)]).limit(24))
     
-    featured = None
-    if not query and not filter_type and movie_list:
-        featured = movie_list[0] 
+    # --- CATEGORY FILTER ---
+    if cat_filter:
+        db_query["category"] = cat_filter
+    
+    # --- TYPE FILTER (Movie vs Series) ---
+    if type_filter:
+        # ডাটাবেসে 'type' ফিল্ড চেক করবে (case-insensitive)
+        db_query["type"] = type_filter
 
-    return render_template_string(index_template, movies=movie_list, query=query, featured=featured)
+    # মোট মুভি এবং পেজিনেশন
+    total_movies = movies.count_documents(db_query)
+    movie_list = list(movies.find(db_query).sort([('updated_at', -1), ('_id', -1)]).skip((page-1)*per_page).limit(per_page))
+    cat_list = list(categories.find())
+    
+    # --- SLIDER LOGIC ---
+    slider_movies = []
+    if not query and not cat_filter and not type_filter:
+        slider_movies = list(movies.find({"backdrop": {"$ne": None}}).sort([('created_at', -1)]).limit(5))
+
+    has_next = (page * per_page) < total_movies
+
+    return render_template_string(index_template, movies=movie_list, categories=cat_list, selected_cat=cat_filter, query=query, slider_movies=slider_movies, page=page, has_next=has_next)
 
 @app.route('/movies')
 def view_movies():
@@ -933,6 +1195,27 @@ def admin_home():
     full_html = admin_base.replace('<!-- CONTENT_GOES_HERE -->', admin_dashboard)
     return render_template_string(full_html, movies=movie_list, page=page, q=q, active='dashboard')
 
+# নতুন ক্যাটাগরি রাউট
+@app.route('/admin/categories', methods=['GET', 'POST'])
+def admin_cats():
+    if not check_auth(): return Response('Login Required', 401)
+    
+    if request.method == 'POST':
+        new_cat = request.form.get('new_category').strip()
+        if new_cat:
+            categories.insert_one({"name": new_cat})
+        return redirect(url_for('admin_cats'))
+    
+    cat_list = list(categories.find())
+    full_html = admin_base.replace('<!-- CONTENT_GOES_HERE -->', admin_categories)
+    return render_template_string(full_html, categories=cat_list, active='categories')
+
+@app.route('/admin/categories/delete/<cat_id>')
+def delete_cat(cat_id):
+    if not check_auth(): return Response('Login Required', 401)
+    categories.delete_one({"_id": ObjectId(cat_id)})
+    return redirect(url_for('admin_cats'))
+
 @app.route('/admin/movie/edit/<movie_id>', methods=['GET', 'POST'])
 def admin_edit_movie(movie_id):
     if not check_auth(): return Response('Login Required', 401)
@@ -940,22 +1223,24 @@ def admin_edit_movie(movie_id):
     if request.method == 'POST':
         update_data = {
             "title": request.form.get("title"),
+            "category": request.form.get("category"), # ক্যাটাগরি আপডেট
             "language": request.form.get("language"),
             "overview": request.form.get("overview"),
             "poster": request.form.get("poster"),
             "backdrop": request.form.get("backdrop"),
             "release_date": request.form.get("release_date"),
             "vote_average": request.form.get("vote_average"),
-            "type": request.form.get("type"),
+            "type": request.form.get("type"), # টাইপ আপডেট (Movie/Series)
             "updated_at": datetime.utcnow()
         }
         movies.update_one({"_id": ObjectId(movie_id)}, {"$set": update_data})
         return redirect(url_for('admin_home'))
         
     movie = movies.find_one({"_id": ObjectId(movie_id)})
+    cat_list = list(categories.find()) # এডিটের জন্য ক্যাটাগরি লিস্ট
     
     full_html = admin_base.replace('<!-- CONTENT_GOES_HERE -->', admin_edit)
-    return render_template_string(full_html, movie=movie, active='dashboard')
+    return render_template_string(full_html, movie=movie, categories=cat_list, active='dashboard')
 
 @app.route('/admin/movie/delete/<movie_id>')
 def admin_delete_movie(movie_id):
